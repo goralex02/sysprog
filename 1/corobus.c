@@ -5,11 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef rlist_for_each_safe
-#define rlist_for_each_safe(pos, n, head) \
-    for ((pos) = (head)->next, (n) = (pos)->next; (pos) != (head); (pos) = (n), (n) = (pos)->next)
-#endif
-
 /* ====== data_vector ====== */
 struct data_vector {
     unsigned *data;
@@ -71,11 +66,12 @@ struct wakeup_queue {
 static void
 wakeup_queue_wakeup_all(struct wakeup_queue *queue)
 {
-    struct rlist *pos, *n;
-    rlist_for_each_safe(pos, n, &queue->coros) {
-         struct wakeup_entry *entry = rlist_entry(pos, struct wakeup_entry, base);
-         coro_wakeup(entry->coro);
-         /* Не удаляем элемент – при возобновлении корутины она сама вызовет rlist_del_entry */
+    struct rlist *pos = queue->coros.next;
+    while (pos != &queue->coros) {
+        struct rlist *n = pos->next;
+        struct wakeup_entry *entry = rlist_entry(pos, struct wakeup_entry, base);
+        coro_wakeup(entry->coro);
+        pos = n;
     }
 }
 
