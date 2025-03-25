@@ -113,9 +113,10 @@ static struct file *create_file(const char *filename) {
 }
 
 static void delete_file(struct file *file) {
-    if (!file) return;
+    if (!file)
+        return;
 
-    // Освобождение блоков
+    // Освобождаем список блоков
     struct block *blk = file->block_list;
     while (blk) {
         struct block *next = blk->next;
@@ -123,6 +124,17 @@ static void delete_file(struct file *file) {
         blk = next;
     }
 
+    // Если файл всё ещё присутствует в глобальном списке, отцепляем его
+    if (file->prev) {
+        file->prev->next = file->next;
+    } else if (file_list == file) {
+        file_list = file->next;
+    }
+    if (file->next) {
+        file->next->prev = file->prev;
+    }
+
+    // Освобождаем имя файла и саму структуру
     free(file->name);
     free(file);
 }
@@ -185,6 +197,11 @@ int ufs_open(const char *filename, int flags) {
     }
 
     struct filedesc *desc = malloc(sizeof(struct filedesc));
+    if (!desc) {
+        set_error(UFS_ERR_NO_MEM);
+        return -1;
+    }
+
     desc->file = file;
     desc->pos = 0;
     desc->flags = access_flags;
@@ -205,12 +222,9 @@ ssize_t ufs_write(int fd, const char *buf, size_t size) {
     struct filedesc *desc = file_descriptors[fd];
     struct file *file = desc->file;
 
-    // УДАЛИТЬ ЭТУ ПРОВЕРКУ
-    // if (file->deleted) {
-    //     set_error(UFS_ERR_NO_FILE);
-    //     return -1;
-    // }
-
+    // Удалённая проверка: если файл удалён, запись всё равно разрешается,
+    // так как открытые дескрипторы должны работать независимо от удаления.
+    
     if ((desc->flags & UFS_WRITE_ONLY) == 0 && (desc->flags & UFS_READ_WRITE) == 0) {
         set_error(UFS_ERR_NO_PERMISSION);
         return -1;
@@ -244,8 +258,7 @@ ssize_t ufs_write(int fd, const char *buf, size_t size) {
         }
 
         size_t space_avail = BLOCK_SIZE - offset_in_blk;
-        size_t to_write = (size - total_written < space_avail) ? 
-                          size - total_written : space_avail;
+        size_t to_write = (size - total_written < space_avail) ? size - total_written : space_avail;
 
         memcpy(blk->memory + offset_in_blk, buf + total_written, to_write);
         
@@ -337,20 +350,25 @@ int ufs_delete(const char *filename) {
         set_error(UFS_ERR_NO_FILE);
         return -1;
     }
-
+    
+    // Помечаем файл как удалённый.
     file->deleted = true;
-
-    // Файл остается в списке до закрытия всех дескрипторов
-    // Удаляем из глобального списка только если нет открытых дескрипторов
+    
+    // Если файл не имеет открытых дескрипторов, можно удалить его сразу.
     if (file->refs == 0) {
-        // Удаление из списка
-        if (file->prev) file->prev->next = file->next;
-        if (file->next) file->next->prev = file->prev;
-        if (file == file_list) file_list = file->next;
-        
+        // Удаляем его из глобального списка:
+        if (file->prev)
+            file->prev->next = file->next;
+        else if (file_list == file)
+            file_list = file->next;
+        if (file->next)
+            file->next->prev = file->prev;
+        // Обнуляем ссылки, чтобы не было циклических связей.
+        file->next = file->prev = NULL;
         delete_file(file);
     }
-
+    // Если файл всё ещё открыт, оставляем его в списке,
+    // чтобы ufs_destroy мог корректно пройти по нему.
     return 0;
 }
 
@@ -374,39 +392,47 @@ int ufs_resize(int fd, size_t new_size) {
     }
 
     if (new_size < file->size) {
+        // Вычисляем, сколько блоков потребуется для нового размера
         size_t blocks_needed = (new_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
         struct block *blk = file->block_list;
+        struct block *last_valid = NULL;
+
+        // Проходим по блокам, оставляем нужное количество
         for (size_t i = 0; i < blocks_needed; ++i) {
-            if (!blk) break;
+            if (!blk)
+                break;
+            last_valid = blk;
             if (i == blocks_needed - 1) {
-                blk->occupied = new_size % BLOCK_SIZE;
-                if (blk->occupied == 0 && new_size != 0) {
-                    blk->occupied = BLOCK_SIZE;
-                }
+                size_t new_occupied = new_size % BLOCK_SIZE;
+                if (new_occupied == 0 && new_size != 0)
+                    new_occupied = BLOCK_SIZE;
+                blk->occupied = new_occupied;
             }
             blk = blk->next;
         }
 
+        // Освобождаем оставшиеся блоки за пределами нового размера
         while (blk) {
             struct block *next = blk->next;
             free_block(blk);
             blk = next;
         }
 
-        file->last_block = blk ? blk->prev : NULL;
-        if (file->last_block) {
-            file->last_block->next = NULL;
+        // Обновляем указатель на последний блок
+        if (last_valid) {
+            last_valid->next = NULL;
+            file->last_block = last_valid;
         } else {
             file->block_list = NULL;
+            file->last_block = NULL;
         }
     } else {
+        // При увеличении размера файла добавляем новые блоки
         size_t additional = new_size - file->size;
         while (additional > 0) {
             struct block *blk = create_block();
-            if (!blk) {
+            if (!blk)
                 return -1;
-            }
-
             size_t to_add = (additional > BLOCK_SIZE) ? BLOCK_SIZE : additional;
             blk->occupied = to_add;
             additional -= to_add;
@@ -422,29 +448,33 @@ int ufs_resize(int fd, size_t new_size) {
     }
 
     file->size = new_size;
-    if (desc->pos > new_size) {
+    if (desc->pos > new_size)
         desc->pos = new_size;
-    }
 
     return 0;
 }
 #endif
 
 void ufs_destroy(void) {
-    struct file *file = file_list;
-    while (file) {
-        struct file *next = file->next;
-        delete_file(file);
-        file = next;
+    /*
+     * Пройдемся по глобальному списку файлов и освободим все файлы.
+     * Теперь все файлы должны находиться в file_list, потому что мы
+     * больше не удаляем файлы с открытыми дескрипторами из списка.
+     */
+    struct file *f = file_list;
+    while (f) {
+        struct file *next = f->next;
+        delete_file(f);
+        f = next;
     }
-
+    
+    // Освобождаем массив дескрипторов.
     for (int i = 0; i < file_descriptor_capacity; ++i) {
-        if (file_descriptors[i]) {
+        if (file_descriptors[i])
             free(file_descriptors[i]);
-        }
     }
     free(file_descriptors);
-
+    
     file_list = NULL;
     file_descriptors = NULL;
     file_descriptor_count = 0;
