@@ -4,32 +4,30 @@
 #include <stdbool.h>
 #include <time.h>
 #include <errno.h>
-
-
-#define UNUSED(x) (void)(x)
+#include <stdio.h>
 
 struct thread_task {
     void *(*func)(void *);
     void *arg;
     void *result;
     bool is_finished;
-    bool is_joined;
     bool is_pushed;
     bool is_detached;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    struct thread_task *next;
 };
 
 struct thread_pool {
-    pthread_t *threads;
-    int max_threads;
-    int active_threads;
-    struct thread_task **task_queue;
-    int task_count;
-    int task_cap;
-    bool is_shutdown;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    int max_threads;
+    int num_threads;
+    int active_threads;
+    struct thread_task *task_queue_head;
+    struct thread_task *task_queue_tail;
+    bool is_shutdown;
+    pthread_t *threads;
 };
 
 static void *worker(void *arg);
@@ -38,25 +36,26 @@ int thread_pool_new(int max_thread_count, struct thread_pool **pool) {
     if (max_thread_count <= 0 || max_thread_count > TPOOL_MAX_THREADS)
         return TPOOL_ERR_INVALID_ARGUMENT;
 
-    struct thread_pool *p = calloc(1, sizeof(*p));
-    if (!p) return TPOOL_ERR_NOT_ENOUGH_MEMORY;
+    struct thread_pool *p = malloc(sizeof(struct thread_pool));
+    if (!p) return TPOOL_ERR_SYSTEM;
 
-    p->threads = calloc(max_thread_count, sizeof(pthread_t));
-    p->task_queue = calloc(TPOOL_MAX_TASKS, sizeof(struct thread_task *));
-    if (!p->threads || !p->task_queue) {
-        free(p->threads);
-        free(p->task_queue);
+    p->max_threads = max_thread_count;
+    p->num_threads = 0;
+    p->active_threads = 0;
+    p->task_queue_head = NULL;
+    p->task_queue_tail = NULL;
+    p->is_shutdown = false;
+    p->threads = malloc(max_thread_count * sizeof(pthread_t));
+    if (!p->threads) {
         free(p);
-        return TPOOL_ERR_NOT_ENOUGH_MEMORY;
+        return TPOOL_ERR_SYSTEM;
     }
 
-    pthread_mutex_init(&p->mutex, NULL);
-    pthread_cond_init(&p->cond, NULL);
-    p->task_cap = TPOOL_MAX_TASKS;
-    p->max_threads = max_thread_count;
-
-    for (int i = 0; i < max_thread_count; i++) {
-        pthread_create(&p->threads[i], NULL, worker, p);
+    if (pthread_mutex_init(&p->mutex, NULL) != 0 ||
+        pthread_cond_init(&p->cond, NULL) != 0) {
+        free(p->threads);
+        free(p);
+        return TPOOL_ERR_SYSTEM;
     }
 
     *pool = p;
@@ -64,12 +63,12 @@ int thread_pool_new(int max_thread_count, struct thread_pool **pool) {
 }
 
 int thread_pool_thread_count(const struct thread_pool *pool) {
-    return pool->active_threads;
+    return pool->num_threads;
 }
 
 int thread_pool_delete(struct thread_pool *pool) {
     pthread_mutex_lock(&pool->mutex);
-    if (pool->task_count > 0) {
+    if (pool->task_queue_head != NULL) {
         pthread_mutex_unlock(&pool->mutex);
         return TPOOL_ERR_HAS_TASKS;
     }
@@ -78,39 +77,40 @@ int thread_pool_delete(struct thread_pool *pool) {
     pthread_cond_broadcast(&pool->cond);
     pthread_mutex_unlock(&pool->mutex);
 
-    for (int i = 0; i < pool->max_threads; i++) {
+    for (int i = 0; i < pool->num_threads; i++)
         pthread_join(pool->threads[i], NULL);
-    }
 
     pthread_mutex_destroy(&pool->mutex);
     pthread_cond_destroy(&pool->cond);
-    free(pool->task_queue);
     free(pool->threads);
     free(pool);
     return 0;
 }
 
-int thread_task_new(struct thread_task **task, void *(*func)(void *), void *arg) {
-    if (!task || !func)
-        return TPOOL_ERR_INVALID_ARGUMENT;
+int thread_task_new(struct thread_task **task, thread_task_f function, void *arg) {
+    struct thread_task *t = malloc(sizeof(struct thread_task));
+    if (!t) return TPOOL_ERR_SYSTEM;
 
-    struct thread_task *t = calloc(1, sizeof(*t));
-    if (!t) return TPOOL_ERR_NOT_ENOUGH_MEMORY;
-
-    t->func = func;
+    t->func = function;
     t->arg = arg;
+    t->is_finished = false;
+    t->is_pushed = false;
+    t->is_detached = false;
+    t->next = NULL;
     pthread_mutex_init(&t->mutex, NULL);
     pthread_cond_init(&t->cond, NULL);
+
     *task = t;
     return 0;
 }
 
 int thread_task_delete(struct thread_task *task) {
-    if (task->is_pushed && !task->is_finished)
+    pthread_mutex_lock(&task->mutex);
+    if (task->is_pushed && !task->is_finished) {
+        pthread_mutex_unlock(&task->mutex);
         return TPOOL_ERR_TASK_IN_POOL;
-
-    if (!task->is_joined && !task->is_detached && task->is_pushed)
-        return TPOOL_ERR_TASK_IN_POOL;
+    }
+    pthread_mutex_unlock(&task->mutex);
 
     pthread_mutex_destroy(&task->mutex);
     pthread_cond_destroy(&task->cond);
@@ -118,129 +118,162 @@ int thread_task_delete(struct thread_task *task) {
     return 0;
 }
 
-int thread_task_join(struct thread_task *task, void **result) {
-    if (!task->is_pushed)
-        return TPOOL_ERR_TASK_NOT_PUSHED;
+int thread_pool_push_task(struct thread_pool *pool, struct thread_task *task) {
+    if (pool == NULL || task == NULL)
+        return TPOOL_ERR_INVALID_ARGUMENT;
 
     pthread_mutex_lock(&task->mutex);
-    while (!task->is_finished)
-        pthread_cond_wait(&task->cond, &task->mutex);
-    if (result)
-        *result = task->result;
-    task->is_joined = true;
+    if (task->is_pushed || !task->is_finished) {
+        pthread_mutex_unlock(&task->mutex);
+        return TPOOL_ERR_TASK_IN_POOL;
+    }
+    task->is_finished = false;
+    task->is_pushed = true;
     pthread_mutex_unlock(&task->mutex);
-    return 0;
-}
 
-int thread_pool_push_task(struct thread_pool *pool, struct thread_task *task) {
     pthread_mutex_lock(&pool->mutex);
-    if (pool->task_count >= pool->task_cap) {
-        pthread_mutex_unlock(&pool->mutex);
-        return TPOOL_ERR_TOO_MANY_TASKS;
+    if (pool->num_threads < pool->max_threads && 
+        pool->active_threads == pool->num_threads) {
+        int err = pthread_create(
+            &pool->threads[pool->num_threads], 
+            NULL, 
+            worker, 
+            pool
+        );
+        if (err) {
+            pthread_mutex_unlock(&pool->mutex);
+            return TPOOL_ERR_SYSTEM;
+        }
+        pool->num_threads++;
     }
 
-    pool->task_queue[pool->task_count++] = task;
-    task->is_pushed = true;
+    if (pool->task_queue_tail) {
+        pool->task_queue_tail->next = task;
+    } else {
+        pool->task_queue_head = task;
+    }
+    pool->task_queue_tail = task;
+    task->next = NULL;
+
     pthread_cond_signal(&pool->cond);
     pthread_mutex_unlock(&pool->mutex);
     return 0;
 }
 
-int thread_task_timed_join(struct thread_task *task, double timeout, void **result) {
-#if NEED_TIMED_JOIN
-    if (!task->is_pushed)
-        return TPOOL_ERR_TASK_NOT_PUSHED;
-
-    pthread_mutex_lock(&task->mutex);
-    if (task->is_finished) {
-        if (result)
-            *result = task->result;
-        task->is_joined = true;
-        pthread_mutex_unlock(&task->mutex);
-        return 0;
-    }
-
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    time_t sec = (time_t)timeout;
-    long nsec = (long)((timeout - sec) * 1e9);
-    ts.tv_sec += sec;
-    ts.tv_nsec += nsec;
-    if (ts.tv_nsec >= 1e9) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1e9;
-    }
-
-    int rc = 0;
-    while (!task->is_finished && rc != ETIMEDOUT)
-        rc = pthread_cond_timedwait(&task->cond, &task->mutex, &ts);
-
-    if (task->is_finished) {
-        if (result)
-            *result = task->result;
-        task->is_joined = true;
-        pthread_mutex_unlock(&task->mutex);
-        return 0;
-    }
-
-    pthread_mutex_unlock(&task->mutex);
-    return TPOOL_ERR_TIMEOUT;
-#else
-    (void)task; (void)timeout; (void)result;
-    return TPOOL_ERR_NOT_IMPLEMENTED;
-#endif
-}
-
-int thread_task_detach(struct thread_task *task) {
-#if NEED_DETACH
-    if (!task->is_pushed)
-        return TPOOL_ERR_TASK_NOT_PUSHED;
-    task->is_detached = true;
-    return 0;
-#else
-    (void)task;
-    return TPOOL_ERR_NOT_IMPLEMENTED;
-#endif
-}
-
 static void *worker(void *arg) {
     struct thread_pool *pool = arg;
 
-    pthread_mutex_lock(&pool->mutex);
-    pool->active_threads++;
-    pthread_mutex_unlock(&pool->mutex);
-
     while (true) {
         pthread_mutex_lock(&pool->mutex);
-        while (pool->task_count == 0 && !pool->is_shutdown)
+        while (!pool->is_shutdown && pool->task_queue_head == NULL)
             pthread_cond_wait(&pool->cond, &pool->mutex);
-        if (pool->is_shutdown && pool->task_count == 0) {
+
+        if (pool->is_shutdown) {
             pthread_mutex_unlock(&pool->mutex);
             break;
         }
 
-        struct thread_task *task = pool->task_queue[0];
-        for (int i = 1; i < pool->task_count; i++)
-            pool->task_queue[i - 1] = pool->task_queue[i];
-        pool->task_count--;
+        struct thread_task *task = pool->task_queue_head;
+        if (task) {
+            pool->task_queue_head = task->next;
+            if (!pool->task_queue_head)
+                pool->task_queue_tail = NULL;
+        }
+        pool->active_threads++;
         pthread_mutex_unlock(&pool->mutex);
 
-        void *res = task->func(task->arg);
+        void *result = task->func(task->arg);
 
         pthread_mutex_lock(&task->mutex);
-        task->result = res;
+        task->result = result;
         task->is_finished = true;
+        task->is_pushed = false;
+        bool is_detached = task->is_detached;
         pthread_cond_broadcast(&task->cond);
         pthread_mutex_unlock(&task->mutex);
 
-#if NEED_DETACH
-        if (task->is_detached)
+        if (is_detached)
             thread_task_delete(task);
-#endif
-    }
 
-    pthread_mutex_lock(&pool->mutex);
-    pool->active_threads--;
-    pthread_mutex_unlock(&pool->mutex);
+        pthread_mutex_lock(&pool->mutex);
+        pool->active_threads--;
+        pthread_mutex_unlock(&pool->mutex);
+    }
     return NULL;
 }
+
+int thread_task_join(struct thread_task *task, void **result) {
+    if (task == NULL) return TPOOL_ERR_INVALID_ARGUMENT;
+
+    pthread_mutex_lock(&task->mutex);
+    if (!task->is_pushed) {
+        pthread_mutex_unlock(&task->mutex);
+        return TPOOL_ERR_TASK_NOT_PUSHED;
+    }
+
+    while (!task->is_finished)
+        pthread_cond_wait(&task->cond, &task->mutex);
+
+    if (result != NULL)
+        *result = task->result;
+    
+    pthread_mutex_unlock(&task->mutex);
+    return 0;
+}
+
+#if NEED_TIMED_JOIN
+int thread_task_timed_join(struct thread_task *task, double timeout, void **result) {
+    if (task == NULL) return TPOOL_ERR_INVALID_ARGUMENT;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)timeout;
+    ts.tv_nsec += (long)(timeout - (time_t)timeout) * 1e9;
+    
+    if (ts.tv_nsec >= 1e9) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1e9;
+    }
+
+    pthread_mutex_lock(&task->mutex);
+    if (!task->is_pushed) {
+        pthread_mutex_unlock(&task->mutex);
+        return TPOOL_ERR_TASK_NOT_PUSHED;
+    }
+
+    while (!task->is_finished) {
+        int err = pthread_cond_timedwait(&task->cond, &task->mutex, &ts);
+        if (err == ETIMEDOUT) {
+            pthread_mutex_unlock(&task->mutex);
+            return TPOOL_ERR_TIMEOUT;
+        }
+    }
+
+    if (result != NULL)
+        *result = task->result;
+    
+    pthread_mutex_unlock(&task->mutex);
+    return 0;
+}
+#endif
+
+#if NEED_DETACH
+int thread_task_detach(struct thread_task *task) {
+    if (task == NULL) return TPOOL_ERR_INVALID_ARGUMENT;
+
+    pthread_mutex_lock(&task->mutex);
+    if (!task->is_pushed) {
+        pthread_mutex_unlock(&task->mutex);
+        return TPOOL_ERR_TASK_NOT_PUSHED;
+    }
+    
+    task->is_detached = true;
+    if (task->is_finished) {
+        pthread_mutex_unlock(&task->mutex);
+        thread_task_delete(task);
+    } else {
+        pthread_mutex_unlock(&task->mutex);
+    }
+    return 0;
+}
+#endif
