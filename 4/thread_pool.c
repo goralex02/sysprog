@@ -123,7 +123,7 @@ int thread_pool_push_task(struct thread_pool *pool, struct thread_task *task) {
         return TPOOL_ERR_INVALID_ARGUMENT;
 
     pthread_mutex_lock(&task->mutex);
-    if (task->is_pushed || !task->is_finished) {
+    if (task->is_pushed) {
         pthread_mutex_unlock(&task->mutex);
         return TPOOL_ERR_TASK_IN_POOL;
     }
@@ -134,12 +134,7 @@ int thread_pool_push_task(struct thread_pool *pool, struct thread_task *task) {
     pthread_mutex_lock(&pool->mutex);
     if (pool->num_threads < pool->max_threads && 
         pool->active_threads == pool->num_threads) {
-        int err = pthread_create(
-            &pool->threads[pool->num_threads], 
-            NULL, 
-            worker, 
-            pool
-        );
+        int err = pthread_create(&pool->threads[pool->num_threads], NULL, worker, pool);
         if (err) {
             pthread_mutex_unlock(&pool->mutex);
             return TPOOL_ERR_SYSTEM;
