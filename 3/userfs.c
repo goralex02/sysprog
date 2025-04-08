@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
-
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 enum {
     BLOCK_SIZE = 512,
     MAX_FILE_SIZE = 1024 * 1024 * 100,
