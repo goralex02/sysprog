@@ -3,6 +3,7 @@
 #include "rlist.h"
 #include <assert.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 struct data_vector {
@@ -13,12 +14,7 @@ struct data_vector {
 static void data_vector_init(struct data_vector *v) { v->data = NULL; v->size = v->capacity = 0; }
 static void data_vector_free(struct data_vector *v) { free(v->data); }
 static void data_vector_append_many(struct data_vector *v, const unsigned *src, size_t n) {
-    if (v->size + n > v->capacity) {
-        size_t newcap = v->capacity ? v->capacity * 2 : 4;
-        if (newcap < v->size + n) newcap = v->size + n;
-        v->data = realloc(v->data, newcap * sizeof *v->data);
-        v->capacity = newcap;
-    }
+    assert(v->size + n <= v->capacity);
     memcpy(v->data + v->size, src, n * sizeof *src);
     v->size += n;
 }
@@ -38,23 +34,41 @@ static size_t data_vector_pop_many(struct data_vector *v, unsigned *dst, size_t 
     return take;
 }
 
+#define MAX_WAITERS 32
+
 struct wakeup_entry { struct rlist link; struct coro *coro; };
-struct wakeup_queue { struct rlist list; };
-static void wakeup_queue_init(struct wakeup_queue *q) { rlist_create(&q->list); }
-static void wakeup_queue_wakeup_all(struct wakeup_queue *q) {
-    while (!rlist_empty(&q->list)) {
-        struct wakeup_entry *e = rlist_first_entry(&q->list, struct wakeup_entry, link);
-        rlist_del_entry(e, link);
-        coro_wakeup(e->coro);
-        free(e);
-    }
+struct wakeup_queue {
+    struct rlist list;
+    struct wakeup_entry pool[MAX_WAITERS];
+    bool used[MAX_WAITERS];
+};
+static void wakeup_queue_init(struct wakeup_queue *q) {
+    rlist_create(&q->list);
+    for (int i = 0; i < MAX_WAITERS; i++)
+        q->used[i] = false;
 }
 static void wakeup_queue_suspend(struct wakeup_queue *q) {
-    struct wakeup_entry *e = malloc(sizeof *e);
+    int idx = -1;
+    for (int i = 0; i < MAX_WAITERS; i++) {
+        if (!q->used[i]) { idx = i; break; }
+    }
+    assert(idx >= 0 && "Too many waiters");
+    q->used[idx] = true;
+    struct wakeup_entry *e = &q->pool[idx];
     e->coro = coro_this();
     rlist_create(&e->link);
     rlist_add_tail_entry(&q->list, e, link);
     coro_suspend();
+}
+static void wakeup_queue_wakeup_all(struct wakeup_queue *q) {
+    while (!rlist_empty(&q->list)) {
+        struct wakeup_entry *e = rlist_first_entry(&q->list, struct wakeup_entry, link);
+        rlist_del_entry(e, link);
+        int idx = e - q->pool;
+        assert(idx >= 0 && idx < MAX_WAITERS);
+        q->used[idx] = false;
+        coro_wakeup(e->coro);
+    }
 }
 
 struct coro_bus_channel {
@@ -92,6 +106,9 @@ int coro_bus_channel_open(struct coro_bus *b, size_t cap) {
     struct coro_bus_channel *c = malloc(sizeof *c);
     c->capacity = cap;
     data_vector_init(&c->buf);
+    c->buf.data = malloc(cap * sizeof *c->buf.data);
+    c->buf.capacity = cap;
+    c->buf.size = 0;
     wakeup_queue_init(&c->send_q);
     wakeup_queue_init(&c->recv_q);
     c->closed = 0;
