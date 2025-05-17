@@ -34,39 +34,26 @@ static size_t data_vector_pop_many(struct data_vector *v, unsigned *dst, size_t 
     return take;
 }
 
-#define MAX_WAITERS 32
+struct wakeup_entry { struct rlist base; struct coro *coro; };
+struct wakeup_queue { struct rlist list; };
 
-struct wakeup_entry { struct rlist link; struct coro *coro; };
-struct wakeup_queue {
-    struct rlist list;
-    struct wakeup_entry pool[MAX_WAITERS];
-    bool used[MAX_WAITERS];
-};
 static void wakeup_queue_init(struct wakeup_queue *q) {
     rlist_create(&q->list);
-    for (int i = 0; i < MAX_WAITERS; i++)
-        q->used[i] = false;
 }
+
 static void wakeup_queue_suspend(struct wakeup_queue *q) {
-    int idx = -1;
-    for (int i = 0; i < MAX_WAITERS; i++) {
-        if (!q->used[i]) { idx = i; break; }
-    }
-    assert(idx >= 0 && "Too many waiters");
-    q->used[idx] = true;
-    struct wakeup_entry *e = &q->pool[idx];
-    e->coro = coro_this();
-    rlist_create(&e->link);
-    rlist_add_tail_entry(&q->list, e, link);
+    struct wakeup_entry entry;
+    entry.coro = coro_this();
+    rlist_create(&entry.base);
+    rlist_add_tail_entry(&q->list, &entry, base);
     coro_suspend();
+    rlist_del_entry(&entry, base);
 }
+
 static void wakeup_queue_wakeup_all(struct wakeup_queue *q) {
     while (!rlist_empty(&q->list)) {
-        struct wakeup_entry *e = rlist_first_entry(&q->list, struct wakeup_entry, link);
-        rlist_del_entry(e, link);
-        int idx = e - q->pool;
-        assert(idx >= 0 && idx < MAX_WAITERS);
-        q->used[idx] = false;
+        struct wakeup_entry *e = rlist_first_entry(&q->list, struct wakeup_entry, base);
+        rlist_del_entry(e, base);
         coro_wakeup(e->coro);
     }
 }
