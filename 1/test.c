@@ -144,11 +144,14 @@ test_channel_reopen(void)
 
 	unit_msg("open and use another channel");
 	int c2 = coro_bus_channel_open(bus, 3);
+	// The channel descriptors must be reused. To avoid infinite growth of
+	// the channel array in the bus.
+	unit_assert(c1 == c2);
 	unit_assert(coro_bus_try_recv(bus, c2, &data) != 0);
 	unit_assert(coro_bus_errno() == CORO_BUS_ERR_WOULD_BLOCK);
-	unit_assert(coro_bus_send(bus, c1, 123) == 0);
-	unit_assert(coro_bus_send(bus, c1, 456) == 0);
-	unit_assert(coro_bus_send(bus, c1, 789) == 0);
+	unit_assert(coro_bus_send(bus, c2, 123) == 0);
+	unit_assert(coro_bus_send(bus, c2, 456) == 0);
+	unit_assert(coro_bus_send(bus, c2, 789) == 0);
 	coro_bus_channel_close(bus, c2);
 
 	unit_msg("open 2 channels");
@@ -885,7 +888,7 @@ test_broadcast_basic(void)
 ////////////////////////////////////////////////////////////////////////////////
 
 static void
-test_broadcast_blocking(void)
+test_broadcast_blocking_basic(void)
 {
 #if NEED_BROADCAST
 	unit_test_start();
@@ -921,22 +924,30 @@ test_broadcast_blocking(void)
 	coro_bus_channel_close(bus, c4);
 
 	unit_msg("make one channel not full, and another - full");
-	unit_assert(coro_bus_send(bus, c1, 4) == 0);
+	unit_assert(coro_bus_send(bus, c2, 4) == 0);
+	unit_assert(coro_bus_try_send(bus, c2, 5) != 0);
+	unit_assert(coro_bus_errno() == CORO_BUS_ERR_WOULD_BLOCK);
 	unsigned data = 0;
-	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 1);
-	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 2);
 	unit_assert(coro_bus_recv(bus, c3, &data) == 0 && data == 3);
 
 	unit_msg("another spurious wakeup");
 	coro_yield();
 	unit_assert(!ctx.is_done);
 
-	unit_msg("finish the broadcast");
+	unit_msg("nothing is delivered yet");
+	// Old message.
 	unit_assert(coro_bus_recv(bus, c1, &data) == 0 && data == 0);
+	// No new messages yet.
+	unit_assert(coro_bus_try_recv(bus, c1, &data) != 0);
+	unit_assert(coro_bus_errno() == CORO_BUS_ERR_WOULD_BLOCK);
+
+	unit_msg("finish the broadcast");
+	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 1);
+	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 2);
+	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 4);
 	unit_assert(broadcast_join(&ctx) == 0);
 
 	unit_msg("cleanup");
-	unit_assert(coro_bus_recv(bus, c1, &data) == 0 && data == 4);
 	unit_assert(coro_bus_recv(bus, c1, &data) == 0 && data == 999);
 	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 999);
 	unit_assert(coro_bus_recv(bus, c3, &data) == 0 && data == 999);
@@ -952,6 +963,52 @@ test_broadcast_blocking(void)
 	coro_bus_channel_close(bus, c2);
 	coro_bus_channel_close(bus, c3);
 
+	coro_bus_delete(bus);
+	unit_test_finish();
+#endif
+}
+
+static void
+test_broadcast_blocking_drop_channel_during_wait(void)
+{
+#if NEED_BROADCAST
+	unit_test_start();
+	struct coro_bus *bus = coro_bus_new();
+
+	unit_msg("create some channels full with data");
+	int c1 = coro_bus_channel_open(bus, 2);
+	unit_assert(c1 >= 0);
+	int c2 = coro_bus_channel_open(bus, 2);
+	unit_assert(c2 >= 0);
+
+	unit_assert(coro_bus_send(bus, c1, 0) == 0);
+	unit_assert(coro_bus_send(bus, c1, 1) == 0);
+	unit_assert(coro_bus_send(bus, c2, 2) == 0);
+	unit_assert(coro_bus_send(bus, c2, 3) == 0);
+
+	unit_msg("start a broadcast");
+	struct ctx_broadcast ctx;
+	broadcast_start(&ctx, bus, 999);
+	coro_yield();
+	unit_assert(ctx.is_started && !ctx.is_done);
+
+	unit_msg("drop one channel");
+	coro_bus_channel_close(bus, c1);
+
+	unit_msg("unblock the other one");
+	unsigned data = 0;
+	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 2);
+	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 3);
+
+	unit_msg("finish the broadcast");
+	unit_assert(broadcast_join(&ctx) == 0);
+
+	unit_msg("data was sent to the remaining channel");
+	unit_assert(coro_bus_recv(bus, c2, &data) == 0 && data == 999);
+	unit_assert(coro_bus_try_recv(bus, c2, &data) != 0);
+	unit_assert(coro_bus_errno() == CORO_BUS_ERR_WOULD_BLOCK);
+
+	coro_bus_channel_close(bus, c2);
 	coro_bus_delete(bus);
 	unit_test_finish();
 #endif
@@ -1568,7 +1625,8 @@ coro_main_f(void *arg)
 	test_close_non_empty_bus();
 
 	test_broadcast_basic();
-	test_broadcast_blocking();
+	test_broadcast_blocking_basic();
+	test_broadcast_blocking_drop_channel_during_wait();
 
 	test_send_vector_basic();
 	test_send_vector_blocking();
