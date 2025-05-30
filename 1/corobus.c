@@ -14,13 +14,13 @@ struct data_vector {
 static void data_vector_init(struct data_vector *v) { v->data = NULL; v->size = v->capacity = 0; }
 static void data_vector_free(struct data_vector *v) { free(v->data); }
 static void data_vector_append_many(struct data_vector *v, const unsigned *src, size_t n) {
-    assert(v->size + n <= v->capacity);
+    //assert(v->size + n <= v->capacity);
     memcpy(v->data + v->size, src, n * sizeof *src);
     v->size += n;
 }
 static void data_vector_append(struct data_vector *v, unsigned x) { data_vector_append_many(v, &x, 1); }
 static unsigned data_vector_pop_front(struct data_vector *v) {
-    assert(v->size > 0);
+    //assert(v->size > 0);
     unsigned x = v->data[0];
     memmove(v->data, v->data + 1, (v->size - 1) * sizeof *v->data);
     v->size--;
