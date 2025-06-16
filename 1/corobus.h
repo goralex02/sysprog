@@ -15,6 +15,7 @@ enum coro_bus_error_code {
 	CORO_BUS_ERR_NO_CHANNEL,
 	CORO_BUS_ERR_WOULD_BLOCK,
 	CORO_BUS_ERR_NOT_IMPLEMENTED,
+	CORO_BUS_ERR_NO_MEMORY,
 };
 
 struct coro_bus;
