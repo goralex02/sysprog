@@ -14,10 +14,19 @@ struct data_vector {
 };
 static void data_vector_init(struct data_vector *v) { v->data = NULL; v->size = v->capacity = 0; }
 static void data_vector_free(struct data_vector *v) { free(v->data); }
-static void data_vector_append_many(struct data_vector *v, const unsigned *src, size_t n) {
-    assert(v->size + n <= v->capacity);
-    memcpy(v->data + v->size, src, n * sizeof *src);
-    v->size += n;
+static void data_vector_append_many(struct data_vector *vector, const unsigned *data, size_t count) {
+    if (vector->size + count > vector->capacity) {
+        if (vector->capacity == 0)
+            vector->capacity = 4;
+        else
+            vector->capacity *= 2;
+        if (vector->capacity < vector->size + count)
+            vector->capacity = vector->size + count;
+        vector->data = realloc(vector->data,
+            sizeof(vector->data[0]) * vector->capacity);
+    }
+    memcpy(&vector->data[vector->size], data, sizeof(data[0]) * count);
+    vector->size += count;
 }
 static void data_vector_append(struct data_vector *v, unsigned x) { data_vector_append_many(v, &x, 1); }
 static unsigned data_vector_pop_front(struct data_vector *v) {
