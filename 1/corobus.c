@@ -6,36 +6,19 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* ===== data_vector ===== */
 struct data_vector {
     unsigned *data;
     size_t size;
     size_t capacity;
 };
-static void data_vector_init(struct data_vector *v) {
-    v->data = NULL;
-    v->size = v->capacity = 0;
-}
-
-static void data_vector_free(struct data_vector *v) {
-    free(v->data);
-}
-
+static void data_vector_init(struct data_vector *v) { v->data = NULL; v->size = v->capacity = 0; }
+static void data_vector_free(struct data_vector *v) { free(v->data); }
 static void data_vector_append_many(struct data_vector *v, const unsigned *src, size_t n) {
-    if (v->size + n > v->capacity) {
-        size_t new_cap = v->capacity ? v->capacity * 2 : 4;
-        if (new_cap < v->size + n) new_cap = v->size + n;
-        v->data = realloc(v->data, new_cap * sizeof *v->data);
-        v->capacity = new_cap;
-    }
+    assert(v->size + n <= v->capacity);
     memcpy(v->data + v->size, src, n * sizeof *src);
     v->size += n;
 }
-
-static void data_vector_append(struct data_vector *v, unsigned x) {
-    data_vector_append_many(v, &x, 1);
-}
-
+static void data_vector_append(struct data_vector *v, unsigned x) { data_vector_append_many(v, &x, 1); }
 static unsigned data_vector_pop_front(struct data_vector *v) {
     assert(v->size > 0);
     unsigned x = v->data[0];
@@ -43,39 +26,38 @@ static unsigned data_vector_pop_front(struct data_vector *v) {
     v->size--;
     return x;
 }
-
-static size_t data_vector_pop_many(struct data_vector *v, unsigned *dst, size_t cap) {
-    size_t t = v->size < cap ? v->size : cap;
-    memcpy(dst, v->data, t * sizeof *dst);
-    v->size -= t;
-    memmove(v->data, v->data + t, v->size * sizeof *v->data);
-    return t;
+static size_t data_vector_pop_many(struct data_vector *v, unsigned *dst, size_t n) {
+    size_t take = n < v->size ? n : v->size;
+    memcpy(dst, v->data, take * sizeof *dst);
+    memmove(v->data, v->data + take, (v->size - take) * sizeof *v->data);
+    v->size -= take;
+    return take;
 }
 
 /* ===== wakeup queue ===== */
-struct wakeup_entry { struct rlist base; struct coro *coro; };
-struct wakeup_queue  { struct rlist coros;       };
-
+// No fixed limits; use stack-allocated entries and intrusive list
+struct wakeup_entry { struct rlist link; struct coro *coro; };
+struct wakeup_queue { struct rlist list; };
 static void wakeup_queue_init(struct wakeup_queue *q) {
-    rlist_create(&q->coros);
+    rlist_create(&q->list);
 }
-
 static void wakeup_queue_suspend(struct wakeup_queue *q) {
     struct wakeup_entry entry;
     entry.coro = coro_this();
-    rlist_add_tail_entry(&q->coros, &entry, base);
+    // Enqueue this coroutine's entry
+    rlist_add_tail_entry(&q->list, &entry, link);
+    // Suspend until woken
     coro_suspend();
-    rlist_del_entry(&entry, base);
+    // Remove from queue on resume
+    rlist_del_entry(&entry, link);
 }
-
 static void wakeup_queue_wakeup_all(struct wakeup_queue *q) {
-    while (!rlist_empty(&q->coros)) {
-        struct wakeup_entry *e = rlist_shift_entry(&q->coros, struct wakeup_entry, base);
+    while (!rlist_empty(&q->list)) {
+        struct wakeup_entry *e = rlist_shift_entry(&q->list, struct wakeup_entry, link);
         coro_wakeup(e->coro);
     }
 }
 
-/* ===== coro bus ===== */
 /* ===== coro bus ===== */
 struct coro_bus_channel {
     size_t capacity;
@@ -139,7 +121,6 @@ void coro_bus_channel_close(struct coro_bus *b, int idx) {
     c->closed = 1;
     wakeup_queue_wakeup_all(&c->send_q);
     wakeup_queue_wakeup_all(&c->recv_q);
-    /* destroy channel and free slot */
     data_vector_free(&c->buf);
     free(c);
     b->ch[idx] = NULL;
@@ -214,7 +195,6 @@ int coro_bus_broadcast(struct coro_bus *b, unsigned x) {
         coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
         return -1;
     }
-    /* Wait until all open channels have space */
     while (1) {
         int any = 0;
         int all_free = 1;
@@ -234,9 +214,7 @@ int coro_bus_broadcast(struct coro_bus *b, unsigned x) {
             return -1;
         }
         if (all_free) break;
-        /* retry after wakeup */
     }
-    /* Broadcast to all channels */
     for (int i = 0; i < b->nch; i++) {
         struct coro_bus_channel *c = b->ch[i];
         if (c && !c->closed) {
