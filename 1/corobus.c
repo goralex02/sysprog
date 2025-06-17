@@ -35,27 +35,51 @@ static size_t data_vector_pop_many(struct data_vector *v, unsigned *dst, size_t 
 }
 
 /* ===== wakeup queue ===== */
-// No fixed limits; use stack-allocated entries and intrusive list
-struct wakeup_entry { struct rlist link; struct coro *coro; };
-struct wakeup_queue { struct rlist list; };
+struct wakeup_queue {
+    struct coro **coros;
+    size_t size;
+    size_t cap;
+};
 static void wakeup_queue_init(struct wakeup_queue *q) {
-    rlist_create(&q->list);
+    q->coros = NULL;
+    q->size = q->cap = 0;
+}
+
+static void wakeup_queue_add(struct wakeup_queue *q, struct coro *c) {
+    size_t newcap = q->cap ? q->cap * 2 : 4;
+    if (q->size + 1 > q->cap) {
+        struct coro **new_coros = malloc(newcap * sizeof *new_coros);
+        if (q->coros) {
+            memcpy(new_coros, q->coros, q->size * sizeof *q->coros);
+            free(q->coros);
+        }
+        q->coros = new_coros;
+        q->cap = newcap;
+    }
+    q->coros[q->size++] = c;
+}
+
+
+static void wakeup_queue_remove(struct wakeup_queue *q, struct coro *c) {
+    for (size_t i = 0; i < q->size; i++) {
+        if (q->coros[i] == c) {
+            q->coros[i] = q->coros[q->size - 1];
+            q->size--;
+            return;
+        }
+    }
 }
 static void wakeup_queue_suspend(struct wakeup_queue *q) {
-    struct wakeup_entry entry;
-    entry.coro = coro_this();
-    // Enqueue this coroutine's entry
-    rlist_add_tail_entry(&q->list, &entry, link);
-    // Suspend until woken
+    struct coro *self = coro_this();
+    wakeup_queue_add(q, self);
     coro_suspend();
-    // Remove from queue on resume
-    rlist_del_entry(&entry, link);
+    wakeup_queue_remove(q, self);
 }
 static void wakeup_queue_wakeup_all(struct wakeup_queue *q) {
-    while (!rlist_empty(&q->list)) {
-        struct wakeup_entry *e = rlist_shift_entry(&q->list, struct wakeup_entry, link);
-        coro_wakeup(e->coro);
+    for (size_t i = 0; i < q->size; i++) {
+        coro_wakeup(q->coros[i]);
     }
+    q->size = 0;
 }
 
 /* ===== coro bus ===== */
@@ -94,7 +118,7 @@ int coro_bus_channel_open(struct coro_bus *b, size_t cap) {
     struct coro_bus_channel *c = malloc(sizeof *c);
     c->capacity = cap;
     data_vector_init(&c->buf);
-    /* Preallocate fixed buffer */
+    /* preallocate buffer */
     c->buf.data = malloc(cap * sizeof *c->buf.data);
     c->buf.capacity = cap;
     c->buf.size = 0;
@@ -102,7 +126,9 @@ int coro_bus_channel_open(struct coro_bus *b, size_t cap) {
     wakeup_queue_init(&c->recv_q);
     c->closed = 0;
     int idx = -1;
-    for (int i = 0; i < b->nch; i++) if (!b->ch[i]) { idx = i; break; }
+    for (int i = 0; i < b->nch; i++) {
+        if (!b->ch[i]) { idx = i; break; }
+    }
     if (idx < 0) {
         idx = b->nch;
         b->ch = realloc(b->ch, (b->nch + 1) * sizeof *b->ch);
@@ -111,6 +137,7 @@ int coro_bus_channel_open(struct coro_bus *b, size_t cap) {
     b->ch[idx] = c;
     return idx;
 }
+
 void coro_bus_channel_close(struct coro_bus *b, int idx) {
     coro_bus_errno_set(CORO_BUS_ERR_NONE);
     if (idx < 0 || idx >= b->nch || !b->ch[idx]) {
@@ -118,9 +145,12 @@ void coro_bus_channel_close(struct coro_bus *b, int idx) {
         return;
     }
     struct coro_bus_channel *c = b->ch[idx];
-    c->closed = 1;
+    c->closed = 1;  /* mark closed */
     wakeup_queue_wakeup_all(&c->send_q);
     wakeup_queue_wakeup_all(&c->recv_q);
+    /* give woken coroutines a chance to remove themselves */
+    coro_yield();
+    /* now safe to free */
     data_vector_free(&c->buf);
     free(c);
     b->ch[idx] = NULL;
@@ -151,6 +181,7 @@ int coro_bus_send(struct coro_bus *b, int idx, unsigned x) {
     wakeup_queue_wakeup_all(&c->recv_q);
     return 0;
 }
+
 int coro_bus_try_send(struct coro_bus *b, int idx, unsigned x) {
     coro_bus_errno_set(CORO_BUS_ERR_NONE);
     struct coro_bus_channel *c;
@@ -163,6 +194,7 @@ int coro_bus_try_send(struct coro_bus *b, int idx, unsigned x) {
     wakeup_queue_wakeup_all(&c->recv_q);
     return 0;
 }
+
 int coro_bus_recv(struct coro_bus *b, int idx, unsigned *out) {
     coro_bus_errno_set(CORO_BUS_ERR_NONE);
     struct coro_bus_channel *c;
@@ -175,6 +207,7 @@ int coro_bus_recv(struct coro_bus *b, int idx, unsigned *out) {
     wakeup_queue_wakeup_all(&c->send_q);
     return 0;
 }
+
 int coro_bus_try_recv(struct coro_bus *b, int idx, unsigned *out) {
     coro_bus_errno_set(CORO_BUS_ERR_NONE);
     struct coro_bus_channel *c;
@@ -224,7 +257,6 @@ int coro_bus_broadcast(struct coro_bus *b, unsigned x) {
     }
     return 0;
 }
-
 int coro_bus_try_broadcast(struct coro_bus *b, unsigned x) {
     coro_bus_errno_set(CORO_BUS_ERR_NONE);
     if (b->nch == 0) {
@@ -300,7 +332,10 @@ int coro_bus_try_recv_v(struct coro_bus *b, int idx, unsigned *data, unsigned ca
     coro_bus_errno_set(CORO_BUS_ERR_NONE);
     struct coro_bus_channel *c;
     if (channel_get(b, idx, &c) < 0) return -1;
-    if (c->buf.size == 0) { coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK); return -1; }
+    if (c->buf.size == 0) {
+        coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
+        return -1;
+    }
     size_t torecv = c->buf.size < cap ? c->buf.size : cap;
     data_vector_pop_many(&c->buf, data, torecv);
     wakeup_queue_wakeup_all(&c->send_q);
