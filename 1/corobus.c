@@ -44,7 +44,11 @@ static void wakeup_queue_init(struct wakeup_queue *q) {
     q->coros = NULL;
     q->size = q->cap = 0;
 }
-
+static void wakeup_queue_free(struct wakeup_queue *q) {
+    free(q->coros);
+    q->coros = NULL;
+    q->size = q->cap = 0;
+}
 static void wakeup_queue_add(struct wakeup_queue *q, struct coro *c) {
     size_t newcap = q->cap ? q->cap * 2 : 4;
     if (q->size + 1 > q->cap) {
@@ -58,8 +62,6 @@ static void wakeup_queue_add(struct wakeup_queue *q, struct coro *c) {
     }
     q->coros[q->size++] = c;
 }
-
-
 static void wakeup_queue_remove(struct wakeup_queue *q, struct coro *c) {
     for (size_t i = 0; i < q->size; i++) {
         if (q->coros[i] == c) {
@@ -106,6 +108,8 @@ void coro_bus_delete(struct coro_bus *b) {
     for (int i = 0; i < b->nch; i++) {
         if (b->ch[i]) {
             data_vector_free(&b->ch[i]->buf);
+            wakeup_queue_free(&b->ch[i]->send_q);
+            wakeup_queue_free(&b->ch[i]->recv_q);
             free(b->ch[i]);
         }
     }
@@ -118,7 +122,6 @@ int coro_bus_channel_open(struct coro_bus *b, size_t cap) {
     struct coro_bus_channel *c = malloc(sizeof *c);
     c->capacity = cap;
     data_vector_init(&c->buf);
-    /* preallocate buffer */
     c->buf.data = malloc(cap * sizeof *c->buf.data);
     c->buf.capacity = cap;
     c->buf.size = 0;
@@ -145,13 +148,13 @@ void coro_bus_channel_close(struct coro_bus *b, int idx) {
         return;
     }
     struct coro_bus_channel *c = b->ch[idx];
-    c->closed = 1;  /* mark closed */
+    c->closed = 1;
     wakeup_queue_wakeup_all(&c->send_q);
     wakeup_queue_wakeup_all(&c->recv_q);
-    /* give woken coroutines a chance to remove themselves */
     coro_yield();
-    /* now safe to free */
     data_vector_free(&c->buf);
+    wakeup_queue_free(&c->send_q);
+    wakeup_queue_free(&c->recv_q);
     free(c);
     b->ch[idx] = NULL;
 }
