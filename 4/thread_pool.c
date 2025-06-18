@@ -36,8 +36,10 @@ struct thread_pool {
     int task_count;
     int running_count;
     int idle_count;
+    int active_threads;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    pthread_cond_t thread_exit_cond;
     bool shutdown;
 };
 
@@ -46,6 +48,7 @@ static void *worker_thread(void *arg)
     struct thread_pool *pool = arg;
     
     pthread_mutex_lock(&pool->mutex);
+    pool->active_threads++;
     
     while (!pool->shutdown) {
         while (pool->head == NULL && !pool->shutdown) {
@@ -94,6 +97,8 @@ static void *worker_thread(void *arg)
         pthread_mutex_lock(&pool->mutex);
     }
     
+    pool->active_threads--;
+    pthread_cond_signal(&pool->thread_exit_cond);
     pthread_mutex_unlock(&pool->mutex);
     return NULL;
 }
@@ -119,6 +124,7 @@ int thread_pool_new(int max_thread_count, struct thread_pool **pool)
     p->task_count = 0;
     p->running_count = 0;
     p->idle_count = 0;
+    p->active_threads = 0;
     p->shutdown = false;
 
     if (pthread_mutex_init(&p->mutex, NULL) != 0) {
@@ -128,6 +134,14 @@ int thread_pool_new(int max_thread_count, struct thread_pool **pool)
     }
     
     if (pthread_cond_init(&p->cond, NULL) != 0) {
+        pthread_mutex_destroy(&p->mutex);
+        free(p->threads);
+        free(p);
+        return TPOOL_ERR_SYSTEM;
+    }
+
+    if (pthread_cond_init(&p->thread_exit_cond, NULL) != 0) {
+        pthread_cond_destroy(&p->cond);
         pthread_mutex_destroy(&p->mutex);
         free(p->threads);
         free(p);
@@ -209,6 +223,11 @@ int thread_pool_delete(struct thread_pool *pool)
     
     pool->shutdown = true;
     pthread_cond_broadcast(&pool->cond);
+    
+    while (pool->active_threads > 0) {
+        pthread_cond_wait(&pool->thread_exit_cond, &pool->mutex);
+    }
+    
     pthread_mutex_unlock(&pool->mutex);
 
     for (int i = 0; i < pool->thread_count; i++) {
@@ -217,6 +236,7 @@ int thread_pool_delete(struct thread_pool *pool)
 
     pthread_mutex_destroy(&pool->mutex);
     pthread_cond_destroy(&pool->cond);
+    pthread_cond_destroy(&pool->thread_exit_cond);
     free(pool->threads);
     free(pool);
     
