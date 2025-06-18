@@ -21,7 +21,7 @@ typedef void *(*thread_task_f)(void *);
 
 enum {
     TPOOL_MAX_THREADS = 20,
-    TPOOL_MAX_TASKS = 20000,//100000,
+    TPOOL_MAX_TASKS = 100000,
 };
 
 enum thread_pool_errcode {
