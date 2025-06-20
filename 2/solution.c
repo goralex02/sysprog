@@ -16,13 +16,16 @@ struct bgproc_list {
 };
 
 static void bgproc_init(struct bgproc_list *bpl) {
-    bpl->jobs = calloc(10, sizeof(pid_t));
+    bpl->jobs = NULL;
     bpl->count = 0;
-    bpl->capacity = 10;
+    bpl->capacity = 0;
 }
 
 static void bgproc_add(struct bgproc_list *bpl, pid_t pid) {
-    if (bpl->count == bpl->capacity) {
+    if (bpl->jobs == NULL) {
+        bpl->capacity = 16;
+        bpl->jobs = malloc(bpl->capacity * sizeof(pid_t));
+    } else if (bpl->count == bpl->capacity) {
         bpl->capacity *= 2;
         bpl->jobs = realloc(bpl->jobs, bpl->capacity * sizeof(pid_t));
     }
@@ -227,3 +230,4 @@ cleanup:
     parser_delete(prs);
     return exit_code;
 }
+
